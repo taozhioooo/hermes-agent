@@ -1,0 +1,192 @@
+# Fork-only distribution workflow. The upstream source is checked out by immutable SHA;
+# no generated assets or source changes are pushed back to NousResearch.
+name: Unofficial Windows Desktop installer
+
+on:
+  schedule:
+    # GitHub cron uses UTC and can be delayed; twice a day is sufficient for tags.
+    - cron: '17 1,13 * * *'
+  workflow_dispatch:
+    inputs:
+      upstream_tag:
+        description: 'Upstream release tag (blank = latest stable release)'
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-desktop-release
+  cancel-in-progress: false
+
+jobs:
+  discover:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      source_tag: ${{ steps.source.outputs.source_tag }}
+      source_sha: ${{ steps.source.outputs.source_sha }}
+      release_tag: ${{ steps.source.outputs.release_tag }}
+      should_build: ${{ steps.source.outputs.should_build }}
+    steps:
+      - name: Resolve upstream release and immutable commit
+        id: source
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REQUESTED_TAG: ${{ inputs.upstream_tag }}
+        run: |
+          set -euo pipefail
+          tag="${REQUESTED_TAG:-}"
+          if [[ -z "$tag" ]]; then
+            tag="$(gh api repos/NousResearch/hermes-agent/releases/latest --jq '.tag_name')"
+          fi
+          # Keep tag names within the upstream calendar-release format; never pass
+          # arbitrary user input into a shell command or Git ref expression.
+          if [[ ! "$tag" =~ ^v[0-9]{4}\.[0-9]{1,2}\.[0-9]{1,2}$ ]]; then
+            printf 'Unsupported upstream release tag: %s\n' "$tag" >&2
+            exit 1
+          fi
+          ref="$(gh api "repos/NousResearch/hermes-agent/git/ref/tags/$tag" --jq '.object')"
+          kind="$(jq -r '.type' <<< "$ref")"
+          source_sha="$(jq -r '.sha' <<< "$ref")"
+          if [[ "$kind" == tag ]]; then
+            source_sha="$(gh api "repos/NousResearch/hermes-agent/git/tags/$source_sha" --jq '.object.sha')"
+          elif [[ "$kind" != commit ]]; then
+            printf 'Unsupported Git tag object type: %s\n' "$kind" >&2
+            exit 1
+          fi
+          if [[ ! "$source_sha" =~ ^[a-f0-9]{40}$ ]]; then
+            printf 'Upstream tag did not resolve to a commit SHA\n' >&2
+            exit 1
+          fi
+          release_tag="windows-$tag"
+          # A draft release also counts as already built. Never overwrite an
+          # existing candidate or silently republish an old Windows binary.
+          if gh release view "$release_tag" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            printf 'Already built: %s\n' "$release_tag"
+            printf 'should_build=false\n' >> "$GITHUB_OUTPUT"
+          else
+            printf 'should_build=true\n' >> "$GITHUB_OUTPUT"
+          fi
+          printf 'source_tag=%s\nsource_sha=%s\nrelease_tag=%s\n' \
+            "$tag" "$source_sha" "$release_tag" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: discover
+    if: needs.discover.outputs.should_build == 'true'
+    runs-on: windows-latest
+    timeout-minutes: 120
+    permissions:
+      contents: read
+    steps:
+      - name: Check out exact upstream commit, not the fork's moving branch
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          repository: NousResearch/hermes-agent
+          ref: ${{ needs.discover.outputs.source_sha }}
+          persist-credentials: false
+
+      - name: Verify checked-out source
+        shell: pwsh
+        env:
+          EXPECTED_SHA: ${{ needs.discover.outputs.source_sha }}
+        run: |
+          $actual = git rev-parse HEAD
+          if ($actual -ne $env:EXPECTED_SHA) { throw "Checked-out commit does not match resolved upstream release" }
+          if (-not (Test-Path apps/desktop/package.json)) { throw 'Upstream tag has no Desktop app' }
+
+      - name: Set up Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '26'
+          cache: npm
+
+      - name: Install locked workspace dependencies
+        shell: pwsh
+        run: npm ci
+
+      - name: Check Desktop types and lint
+        shell: pwsh
+        run: |
+          npm --workspace apps/desktop run typecheck
+          if ($LASTEXITCODE -ne 0) { throw 'Desktop typecheck failed' }
+          npm --workspace apps/desktop run lint
+          if ($LASTEXITCODE -ne 0) { throw 'Desktop lint failed' }
+
+      - name: Test remote first-run and Desktop Electron paths
+        shell: pwsh
+        run: |
+          npm --workspace apps/desktop run test -- electron/first-run-setup-main-process.test.ts electron/primary-backend-startup.test.ts
+          if ($LASTEXITCODE -ne 0) { throw 'Remote first-run tests failed' }
+          npm --workspace apps/desktop run test:desktop:platforms
+          if ($LASTEXITCODE -ne 0) { throw 'Desktop Electron tests failed' }
+
+      - name: Build precompiled Windows x64 NSIS installer
+        shell: pwsh
+        working-directory: apps/desktop
+        run: |
+          npm run dist:win:nsis -- --x64
+          if ($LASTEXITCODE -ne 0) { throw 'NSIS packaging failed' }
+
+      - name: Stage installer, checksum and source provenance
+        shell: pwsh
+        env:
+          SOURCE_TAG: ${{ needs.discover.outputs.source_tag }}
+          SOURCE_SHA: ${{ needs.discover.outputs.source_sha }}
+        run: |
+          $installers = @(Get-ChildItem 'apps/desktop/release/*.exe' -File)
+          if ($installers.Count -ne 1) { throw "Expected exactly one NSIS installer; found $($installers.Count)" }
+          $installer = $installers[0]
+          if ($installer.Length -lt 1000000) { throw 'Installer is unexpectedly small' }
+          $out = Join-Path $env:RUNNER_TEMP 'windows-installer'
+          New-Item -ItemType Directory -Path $out -Force | Out-Null
+          Copy-Item $installer.FullName (Join-Path $out 'Hermes-Desktop-Windows-x64-Setup.exe')
+          $hash = (Get-FileHash (Join-Path $out 'Hermes-Desktop-Windows-x64-Setup.exe') -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$hash  Hermes-Desktop-Windows-x64-Setup.exe" | Set-Content (Join-Path $out 'SHA256SUMS.txt') -Encoding ascii
+          "Upstream tag: $env:SOURCE_TAG`nUpstream commit: $env:SOURCE_SHA`nDesktop is precompiled; local Agent is NOT bundled. Choose 'Connect to existing Hermes' on first launch." | Set-Content (Join-Path $out 'SOURCE.txt') -Encoding utf8
+          "ASSET_DIR=$out" >> $env:GITHUB_ENV
+
+      - name: Archive candidate (even before public publication)
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: windows-installer-${{ needs.discover.outputs.source_tag }}
+          path: ${{ env.ASSET_DIR }}/*
+          if-no-files-found: error
+          retention-days: 30
+
+  draft_release:
+    needs: [discover, build]
+    if: needs.build.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - name: Download verified build artifacts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: windows-installer-${{ needs.discover.outputs.source_tag }}
+          path: release-assets
+
+      - name: Create draft release for human approval
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.discover.outputs.release_tag }}
+          SOURCE_TAG: ${{ needs.discover.outputs.source_tag }}
+          SOURCE_SHA: ${{ needs.discover.outputs.source_sha }}
+        run: |
+          set -euo pipefail
+          cd release-assets
+          sha256sum --check SHA256SUMS.txt
+          # This release tag points to the fork's workflow commit, not the
+          # upstream source. SOURCE.txt records the exact compiled commit.
+          gh release create "$RELEASE_TAG" \
+            Hermes-Desktop-Windows-x64-Setup.exe SHA256SUMS.txt SOURCE.txt \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "Unofficial Hermes Desktop Windows x64 ($SOURCE_TAG)" \
+            --notes "Precompiled NSIS installer from NousResearch/hermes-agent@$SOURCE_SHA. Choose 'Connect to existing Hermes' to use a remote gateway without installing a local Agent. Local mode remains available and may download dependencies. Unsigned community build; not an official Nous Research release. Validate on a Windows 10/11 workstation before publishing this draft." \
+            --draft
