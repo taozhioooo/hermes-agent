@@ -166,15 +166,35 @@ jobs:
           npm --workspace apps/desktop run test -- electron/first-run-setup-main-process.test.ts electron/primary-backend-startup.test.ts
           if ($LASTEXITCODE -ne 0) { throw 'Remote first-run tests failed' }
 
-      - name: Build precompiled Windows x64 NSIS installer
+      - name: Build Desktop and pin the upstream bootstrap source
         shell: pwsh
         working-directory: apps/desktop
         env:
-          # The build-stamp script otherwise sees the fork workflow SHA.
-          GITHUB_SHA: ${{ needs.discover.outputs.source_sha }}
-          GITHUB_REF_NAME: ${{ needs.discover.outputs.source_tag }}
+          SOURCE_SHA: ${{ needs.discover.outputs.source_sha }}
+          SOURCE_TAG: ${{ needs.discover.outputs.source_tag }}
         run: |
-          npm run dist:win:nsis -- --x64
+          npm run build
+          if ($LASTEXITCODE -ne 0) { throw 'Desktop build failed' }
+          # npm may re-inject the workflow's fork SHA into nested lifecycle
+          # scripts. Replace the generated stamp before electron-builder stages
+          # extraResources, using only the discover job's immutable upstream ref.
+          $stampPath = 'build/install-stamp.json'
+          $stamp = Get-Content $stampPath -Raw | ConvertFrom-Json
+          $stamp.commit = $env:SOURCE_SHA
+          $stamp.branch = $env:SOURCE_TAG
+          $stamp.dirty = $false
+          $stamp.source = 'ci'
+          $stamp | ConvertTo-Json -Depth 5 | Set-Content $stampPath -Encoding utf8NoBOM
+          $verified = Get-Content $stampPath -Raw | ConvertFrom-Json
+          if ($verified.commit -ne $env:SOURCE_SHA -or $verified.branch -ne $env:SOURCE_TAG) {
+            throw 'Bootstrap stamp does not match pinned upstream source'
+          }
+
+      - name: Package precompiled Windows x64 NSIS installer
+        shell: pwsh
+        working-directory: apps/desktop
+        run: |
+          npm run builder -- --win nsis --x64
           if ($LASTEXITCODE -ne 0) { throw 'NSIS packaging failed' }
 
       - name: Stage installer, checksum and source provenance
@@ -186,6 +206,10 @@ jobs:
         run: |
           $stamp = Get-Content apps/desktop/build/install-stamp.json -Raw | ConvertFrom-Json
           if ($stamp.commit -ne $env:SOURCE_SHA) { throw 'Packaged bootstrap stamp does not match upstream source' }
+          $resourceStamp = Get-Content apps/desktop/release/win-unpacked/resources/install-stamp.json -Raw | ConvertFrom-Json
+          if ($resourceStamp.commit -ne $env:SOURCE_SHA -or $resourceStamp.branch -ne $env:SOURCE_TAG) {
+            throw 'Installer resources do not contain the pinned upstream bootstrap stamp'
+          }
           $packaged = (Get-Content apps/desktop/package.json -Raw | ConvertFrom-Json).version
           if ($packaged -ne $env:DESKTOP_VERSION) { throw 'Packaged Desktop version does not match upstream Agent version' }
           $installers = @(Get-ChildItem 'apps/desktop/release/*.exe' -File)
