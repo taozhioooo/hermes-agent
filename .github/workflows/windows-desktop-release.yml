@@ -142,7 +142,10 @@ jobs:
             if ($LASTEXITCODE -ne 0) { throw 'Failed to align Desktop package version' }
           }
           $packaged = (Get-Content apps/desktop/package.json -Raw | ConvertFrom-Json).version
-          $locked = (Get-Content package-lock.json -Raw | ConvertFrom-Json).packages.'apps/desktop'.version
+          # npm lockfiles contain a valid empty-string root package key;
+          # PowerShell's object-mode JSON parser rejects it.
+          $lock = Get-Content package-lock.json -Raw | ConvertFrom-Json -AsHashtable
+          $locked = $lock['packages']['apps/desktop']['version']
           if ($packaged -ne $version -or $locked -ne $version) { throw 'Desktop package and lockfile versions diverge' }
           "desktop_version=$version" >> $env:GITHUB_OUTPUT
 
