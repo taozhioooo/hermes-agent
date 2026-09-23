@@ -12,6 +12,11 @@ on:
         description: 'Upstream release tag (blank = latest stable release)'
         required: false
         type: string
+      build_revision:
+        description: 'Candidate revision when rebuilding the same upstream tag'
+        required: false
+        default: '1'
+        type: string
 
 permissions:
   contents: read
@@ -36,6 +41,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           REQUESTED_TAG: ${{ inputs.upstream_tag }}
+          BUILD_REVISION: ${{ inputs.build_revision }}
         run: |
           set -euo pipefail
           tag="${REQUESTED_TAG:-}"
@@ -61,7 +67,15 @@ jobs:
             printf 'Upstream tag did not resolve to a commit SHA\n' >&2
             exit 1
           fi
+          revision="${BUILD_REVISION:-1}"
+          if [[ ! "$revision" =~ ^[1-9][0-9]*$ ]]; then
+            printf 'Build revision must be a positive integer\n' >&2
+            exit 1
+          fi
           release_tag="windows-$tag"
+          if [[ "$revision" != 1 ]]; then
+            release_tag="${release_tag}-r${revision}"
+          fi
           # A draft release also counts as already built. Never overwrite an
           # existing candidate or silently republish an old Windows binary.
           if gh release view "$release_tag" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
@@ -78,6 +92,8 @@ jobs:
     if: needs.discover.outputs.should_build == 'true'
     runs-on: windows-latest
     timeout-minutes: 120
+    outputs:
+      desktop_version: ${{ steps.version.outputs.desktop_version }}
     permissions:
       contents: read
     steps:
@@ -103,9 +119,32 @@ jobs:
           node-version: '26'
           cache: npm
 
+      - name: Set up Python for reading canonical project version
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: '3.11'
+
       - name: Install locked workspace dependencies
         shell: pwsh
         run: npm ci
+
+      - name: Align packaged Desktop version with upstream Agent version
+        id: version
+        shell: pwsh
+        run: |
+          $version = (python -c "import tomllib; print(tomllib.load(open('pyproject.toml', 'rb'))['project']['version'])").Trim()
+          if ($LASTEXITCODE -ne 0 -or $version -notmatch '^\d+\.\d+\.\d+$') { throw 'Invalid upstream project version' }
+          $current = (Get-Content apps/desktop/package.json -Raw | ConvertFrom-Json).version
+          if ($current -ne $version) {
+            # npm version updates both the workspace package and root lockfile;
+            # this is ephemeral packaging metadata, never pushed upstream.
+            npm version $version --workspace apps/desktop --no-git-tag-version --ignore-scripts
+            if ($LASTEXITCODE -ne 0) { throw 'Failed to align Desktop package version' }
+          }
+          $packaged = (Get-Content apps/desktop/package.json -Raw | ConvertFrom-Json).version
+          $locked = (Get-Content package-lock.json -Raw | ConvertFrom-Json).packages.'apps/desktop'.version
+          if ($packaged -ne $version -or $locked -ne $version) { throw 'Desktop package and lockfile versions diverge' }
+          "desktop_version=$version" >> $env:GITHUB_OUTPUT
 
       - name: Check Desktop types and lint
         shell: pwsh
@@ -127,6 +166,10 @@ jobs:
       - name: Build precompiled Windows x64 NSIS installer
         shell: pwsh
         working-directory: apps/desktop
+        env:
+          # The build-stamp script otherwise sees the fork workflow SHA.
+          GITHUB_SHA: ${{ needs.discover.outputs.source_sha }}
+          GITHUB_REF_NAME: ${{ needs.discover.outputs.source_tag }}
         run: |
           npm run dist:win:nsis -- --x64
           if ($LASTEXITCODE -ne 0) { throw 'NSIS packaging failed' }
@@ -136,7 +179,12 @@ jobs:
         env:
           SOURCE_TAG: ${{ needs.discover.outputs.source_tag }}
           SOURCE_SHA: ${{ needs.discover.outputs.source_sha }}
+          DESKTOP_VERSION: ${{ steps.version.outputs.desktop_version }}
         run: |
+          $stamp = Get-Content apps/desktop/build/install-stamp.json -Raw | ConvertFrom-Json
+          if ($stamp.commit -ne $env:SOURCE_SHA) { throw 'Packaged bootstrap stamp does not match upstream source' }
+          $packaged = (Get-Content apps/desktop/package.json -Raw | ConvertFrom-Json).version
+          if ($packaged -ne $env:DESKTOP_VERSION) { throw 'Packaged Desktop version does not match upstream Agent version' }
           $installers = @(Get-ChildItem 'apps/desktop/release/*.exe' -File)
           if ($installers.Count -ne 1) { throw "Expected exactly one NSIS installer; found $($installers.Count)" }
           $installer = $installers[0]
@@ -146,7 +194,7 @@ jobs:
           Copy-Item $installer.FullName (Join-Path $out 'Hermes-Desktop-Windows-x64-Setup.exe')
           $hash = (Get-FileHash (Join-Path $out 'Hermes-Desktop-Windows-x64-Setup.exe') -Algorithm SHA256).Hash.ToLowerInvariant()
           "$hash  Hermes-Desktop-Windows-x64-Setup.exe" | Set-Content (Join-Path $out 'SHA256SUMS.txt') -Encoding ascii
-          "Upstream tag: $env:SOURCE_TAG`nUpstream commit: $env:SOURCE_SHA`nDesktop is precompiled; local Agent is NOT bundled. Choose 'Connect to existing Hermes' on first launch." | Set-Content (Join-Path $out 'SOURCE.txt') -Encoding utf8
+          "Upstream tag: $env:SOURCE_TAG`nUpstream commit: $env:SOURCE_SHA`nPackaged Desktop version: $env:DESKTOP_VERSION`nDesktop is precompiled; local Agent is NOT bundled. Choose 'Connect to existing Hermes' on first launch." | Set-Content (Join-Path $out 'SOURCE.txt') -Encoding utf8
           "ASSET_DIR=$out" >> $env:GITHUB_ENV
 
       - name: Archive candidate (even before public publication)
@@ -178,6 +226,7 @@ jobs:
           RELEASE_TAG: ${{ needs.discover.outputs.release_tag }}
           SOURCE_TAG: ${{ needs.discover.outputs.source_tag }}
           SOURCE_SHA: ${{ needs.discover.outputs.source_sha }}
+          DESKTOP_VERSION: ${{ needs.build.outputs.desktop_version }}
         run: |
           set -euo pipefail
           cd release-assets
@@ -188,6 +237,6 @@ jobs:
             Hermes-Desktop-Windows-x64-Setup.exe SHA256SUMS.txt SOURCE.txt \
             --repo "$GITHUB_REPOSITORY" \
             --target "$GITHUB_SHA" \
-            --title "Unofficial Hermes Desktop Windows x64 ($SOURCE_TAG)" \
-            --notes "Precompiled NSIS installer from NousResearch/hermes-agent@$SOURCE_SHA. Choose 'Connect to existing Hermes' to use a remote gateway without installing a local Agent. Local mode remains available and may download dependencies. Unsigned community build; not an official Nous Research release. Validate on a Windows 10/11 workstation before publishing this draft." \
+            --title "Unofficial Hermes Desktop v$DESKTOP_VERSION Windows x64 ($SOURCE_TAG)" \
+            --notes "Precompiled NSIS installer from NousResearch/hermes-agent@$SOURCE_SHA. Desktop package version aligned to the Agent project version ($DESKTOP_VERSION) at this commit; it does not assert the connected remote backend has the same version. Choose 'Connect to existing Hermes' to use a remote gateway without installing a local Agent. Local mode remains available and may download dependencies. Unsigned community build; not an official Nous Research release. Validate on a Windows 10/11 workstation before publishing this draft." \
             --draft
